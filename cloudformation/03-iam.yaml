@@ -3,6 +3,8 @@ Description: >
   Stack 03 - IAM. Management EC2 role + instance profile (the identity that runs
   Terraform on the box), plus the separate application execution roles for
   Lambda and Step Functions. EC2 and Lambda never share a role.
+  Terraform uses LOCAL state on the box, so there is no state bucket or lock
+  table and no policy for them.
   Naming convention: <NamePrefix>_<type>_<NameSuffix>.
 
 Parameters:
@@ -33,16 +35,6 @@ Parameters:
       Bucket for build artifacts / Lambda packages. Created later by Terraform;
       named here so the policy can be scoped to it up front.
       Hyphenated: S3 bucket names may not contain underscores.
-
-  TerraformStateBucketName:
-    Type: String
-    Default: mpa-sec-s3-tfstate-oaidaybreak
-    Description: Bucket holding the Terraform remote state (hyphenated, S3 rule).
-
-  TerraformLockTableName:
-    Type: String
-    Default: mpa_sec_ddb_tflock_oaidaybreak
-    Description: DynamoDB table for Terraform state locking.
 
   BucketNamePattern:
     Type: String
@@ -182,17 +174,13 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                   - s3:DeleteObject
-                Resource:
-                  - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*'
-                  - !Sub 'arn:${AWS::Partition}:s3:::${TerraformStateBucketName}/*'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*'
               - Effect: Allow
                 Action:
                   - s3:ListBucket
                   - s3:GetBucketLocation
                   - s3:GetBucketVersioning
-                Resource:
-                  - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}'
-                  - !Sub 'arn:${AWS::Partition}:s3:::${TerraformStateBucketName}'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}'
               # Terraform creates the remaining buckets.
               - Effect: Allow
                 Action:
@@ -217,19 +205,6 @@ Resources:
                   - s3:GetAccelerateConfiguration
                   - s3:GetReplicationConfiguration
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePattern}'
-
-        # ---- Terraform state locking ----
-        - PolicyName: terraform-state-lock
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
-                  - dynamodb:DeleteItem
-                  - dynamodb:DescribeTable
-                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TerraformLockTableName}'
 
         # ---- Lambda ----
         - PolicyName: lambda-manage

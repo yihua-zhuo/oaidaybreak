@@ -103,7 +103,9 @@ Resources:
           ./aws/install --update
           rm -rf /tmp/aws /tmp/awscliv2.zip
 
-          # Terraform -- this box provisions S3 / Lambda / Step Functions / Bedrock
+          # Terraform -- this box provisions S3 / Lambda / Step Functions / Bedrock.
+          # State is LOCAL (terraform.tfstate under /opt/infra), so the root
+          # volume is the only copy: DeleteOnTermination applies, back it up.
           curl -fsSL -o terraform.zip \
             "https://releases.hashicorp.com/terraform/${TerraformVersion}/terraform_${TerraformVersion}_linux_amd64.zip"
           unzip -q -o terraform.zip -d /usr/local/bin
@@ -115,6 +117,7 @@ Resources:
           echo "export AWS_REGION=${AWS::Region}"        >> /etc/profile.d/aws-region.sh
           chmod 0644 /etc/profile.d/aws-region.sh
 
+          # Working dir for the Terraform config + its local state file.
           mkdir -p /opt/infra
           chown ssm-user:ssm-user /opt/infra 2>/dev/null || true
 
