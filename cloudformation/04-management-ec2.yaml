@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Stack 04 - Management EC2 (mpa_sec_ec2_oaidaybreak). Public subnet, EIP,
+  no inbound, SSM-managed, encrypted gp3 root, IMDSv2 required. UserData installs
+  Terraform + AWS CLI so the box can build the remaining resources
+  (S3, Lambda, Step Functions, Bedrock).
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: mpa_sec
+
+  NameSuffix:
+    Type: String
+    Default: oaidaybreak
+
+  ExportPrefix:
+    Type: String
+    Default: mpa-sec-oaidaybreak
+
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet from Stack 01 (PublicSubnetAId).
+
+  ManagementSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: SG from Stack 02 (ManagementSecurityGroupId).
+
+  ManagementInstanceProfileName:
+    Type: String
+    Default: mpa_sec_instprof_mgmt_ec2_oaidaybreak
+    Description: Instance profile name from Stack 03.
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: >
+      Resolved from SSM Public Parameters, so the stack always picks up the
+      current Amazon Linux 2023 AMI. Override with a pinned AMI id if required.
+
+  RootVolumeSize:
+    Type: Number
+    Default: 30
+    MinValue: 8
+
+  TerraformVersion:
+    Type: String
+    Default: 1.9.8
+    Description: Terraform version installed by UserData.
+
+  AllocateElasticIp:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Attach a stable EIP. With 'false' the instance still gets an
+      auto-assigned public IP from the subnet, which changes on stop/start.
+
+Conditions:
+  WithEip: !Equals [!Ref AllocateElasticIp, 'true']
+
+Resources:
+  ManagementEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnetId
+      SecurityGroupIds:
+        - !Ref ManagementSecurityGroupId
+      IamInstanceProfile: !Ref ManagementInstanceProfileName
+      # No KeyName on purpose: there is no SSH path in or out of this box.
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf -y update
+          # ssm-agent ships preinstalled on AL2023; make sure it is running.
+          systemctl enable --now amazon-ssm-agent
+
+          dnf -y install git jq unzip tar gzip
+
+          # AWS CLI v2
+          cd /tmp
+          curl -fsSL -o awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+          unzip -q awscliv2.zip
+          ./aws/install --update
+          rm -rf /tmp/aws /tmp/awscliv2.zip
+
+          # Terraform -- this box provisions S3 / Lambda / Step Functions / Bedrock
+          curl -fsSL -o terraform.zip \
+            "https://releases.hashicorp.com/terraform/${TerraformVersion}/terraform_${TerraformVersion}_linux_amd64.zip"
+          unzip -q -o terraform.zip -d /usr/local/bin
+          chmod +x /usr/local/bin/terraform
+          rm -f /tmp/terraform.zip
+
+          # Default region for the CLI / Terraform AWS provider.
+          echo "export AWS_DEFAULT_REGION=${AWS::Region}" > /etc/profile.d/aws-region.sh
+          echo "export AWS_REGION=${AWS::Region}"        >> /etc/profile.d/aws-region.sh
+          chmod 0644 /etc/profile.d/aws-region.sh
+
+          mkdir -p /opt/infra
+          chown ssm-user:ssm-user /opt/infra 2>/dev/null || true
+
+          terraform version
+          /usr/local/bin/aws --version
+
+          /opt/aws/bin/cfn-signal --exit-code 0 \
+            --stack ${AWS::StackName} \
+            --resource ManagementEC2 \
+            --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_ec2_${NameSuffix}'
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+
+  ManagementEIP:
+    Type: AWS::EC2::EIP
+    Condition: WithEip
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_eip_ec2_${NameSuffix}'
+
+  ManagementEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: WithEip
+    Properties:
+      InstanceId: !Ref ManagementEC2
+      AllocationId: !GetAtt ManagementEIP.AllocationId
+
+Outputs:
+  InstanceId:
+    Value: !Ref ManagementEC2
+    Export:
+      Name: !Sub '${ExportPrefix}-ManagementInstanceId'
+
+  PublicIp:
+    Description: EIP if allocated, otherwise the subnet-assigned public IP.
+    Value: !If [WithEip, !Ref ManagementEIP, !GetAtt ManagementEC2.PublicIp]
+
+  PrivateIp:
+    Value: !GetAtt ManagementEC2.PrivateIp
+
+  SsmSessionCommand:
+    Description: How to get a shell on the box - there is no SSH.
+    Value: !Sub 'aws ssm start-session --target ${ManagementEC2} --region ${AWS::Region}'
