@@ -1,0 +1,882 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Management bootstrap for oaidaybreak - single stack.
+
+  Creates the network, security groups, the management EC2 role and the
+  management EC2 itself (mpa_sec_ec2_oaidaybreak). Everything downstream - S3,
+  Lambda, Step Functions, Bedrock, and the application IAM roles - is
+  provisioned with Terraform FROM this instance, using local state, which is
+  why the EC2 role carries those permissions instead of this template creating
+  the resources.
+
+  No SSH: no key pair, and the management SG has zero inbound rules. Access is
+  via SSM Session Manager. No NAT Gateway: private subnets have no Internet
+  egress and reach S3 through the gateway endpoint only.
+
+  Naming convention: <NamePrefix>_<type>_<NameSuffix>, e.g. mpa_sec_ec2_oaidaybreak.
+  Hyphens are used only where underscores are illegal (S3 buckets) or awkward
+  (CloudFormation exports).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Naming
+        Parameters: [NamePrefix, NameSuffix, ExportPrefix]
+      - Label:
+          default: Network
+        Parameters:
+          - VpcCidr
+          - PublicSubnetACidr
+          - PublicSubnetBCidr
+          - PrivateSubnetACidr
+          - PrivateSubnetBCidr
+          - AllowHttpEgress
+      - Label:
+          default: Management EC2
+        Parameters:
+          - InstanceType
+          - AmiId
+          - RootVolumeSize
+          - TerraformVersion
+          - AllocateElasticIp
+      - Label:
+          default: IAM scoping
+        Parameters:
+          - AppResourcePattern
+          - ArtifactBucketName
+          - BucketNamePattern
+          - AppRolePath
+          - AppRolePattern
+          - BedrockModelIdPattern
+
+Parameters:
+  # ---------------- Naming ----------------
+  NamePrefix:
+    Type: String
+    Default: mpa_sec
+    Description: First segment of every resource name.
+
+  NameSuffix:
+    Type: String
+    Default: oaidaybreak
+    Description: Last segment of every resource name.
+
+  ExportPrefix:
+    Type: String
+    Default: mpa-sec-oaidaybreak
+    Description: >
+      Prefix for CloudFormation export names, so Terraform (or a later stack)
+      can look these values up. Hyphenated: underscores are awkward in exports.
+
+  # ---------------- Network ----------------
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+
+  PublicSubnetACidr:
+    Type: String
+    Default: 10.20.0.0/24
+
+  PublicSubnetBCidr:
+    Type: String
+    Default: 10.20.1.0/24
+
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.20.10.0/24
+
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.20.11.0/24
+
+  AllowHttpEgress:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Open TCP 80 egress on the management SG as well. Amazon Linux 2023 repos
+      are HTTPS, so leave false unless you need a plain-HTTP mirror.
+
+  # ---------------- Management EC2 ----------------
+  InstanceType:
+    Type: String
+    Default: t3.small
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: >
+      Resolved from SSM Public Parameters, so the stack always picks up the
+      current Amazon Linux 2023 AMI. Override with a pinned AMI id if required.
+
+  RootVolumeSize:
+    Type: Number
+    Default: 30
+    MinValue: 8
+
+  TerraformVersion:
+    Type: String
+    Default: 1.9.8
+    Description: Terraform version installed by UserData.
+
+  AllocateElasticIp:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Attach a stable EIP. With 'false' the instance still gets an
+      auto-assigned public IP from the subnet, which changes on stop/start.
+
+  # ---------------- IAM scoping ----------------
+  AppResourcePattern:
+    Type: String
+    Default: mpa-sec-*-oaidaybreak
+    Description: >
+      Hyphenated name pattern for the Lambda / Step Functions / CloudFormation
+      resources Terraform will create, used to scope the policies below.
+      Hyphens because these names feed ARNs and S3-style identifiers.
+
+  ArtifactBucketName:
+    Type: String
+    Default: mpa-sec-s3-artifacts-oaidaybreak
+    Description: >
+      Bucket for build artifacts / Lambda packages. Created later by Terraform;
+      named here so the policy can be scoped to it up front.
+      Hyphenated: S3 bucket names may not contain underscores.
+
+  BucketNamePattern:
+    Type: String
+    Default: mpa-sec-s3-*-oaidaybreak
+    Description: Pattern for buckets Terraform is allowed to create.
+
+  AppRolePath:
+    Type: String
+    Default: /oaidaybreak/
+    AllowedPattern: '^/.*/$'
+    Description: >
+      IAM path Terraform must create the application roles under. Acts as the
+      real boundary: this instance's own role lives at '/', so it cannot modify
+      itself. Terraform must set `path = "/oaidaybreak/"` on those roles.
+
+  AppRolePattern:
+    Type: String
+    Default: mpa_sec_role_*_oaidaybreak
+    Description: Name pattern the application roles must match.
+
+  BedrockModelIdPattern:
+    Type: String
+    Default: '*'
+    Description: >
+      Foundation-model id pattern the application roles may invoke,
+      e.g. 'anthropic.claude-*'. Default '*' allows any model in-region.
+
+Conditions:
+  WithHttpEgress: !Equals [!Ref AllowHttpEgress, 'true']
+  WithEip: !Equals [!Ref AllocateElasticIp, 'true']
+
+Resources:
+  # ==========================================================
+  # 1. Network
+  # ==========================================================
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_vpc_${NameSuffix}'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_igw_${NameSuffix}'
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------------- Public subnets ----------------
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_subnet_public_a_${NameSuffix}'
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_subnet_public_b_${NameSuffix}'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_rtb_public_${NameSuffix}'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------- Private subnets ----------------
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_subnet_private_a_${NameSuffix}'
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_subnet_private_b_${NameSuffix}'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_rtb_private_${NameSuffix}'
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------- Gateway endpoint for S3 ----------------
+  # The only way the private subnets reach S3, now that there is no NAT Gateway.
+  # Also keeps public-subnet S3 traffic off the IGW path.
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTable
+
+  # ==========================================================
+  # 2. Security Groups
+  # ==========================================================
+
+  # Inbound: NONE. There is intentionally no SecurityGroupIngress block, so
+  # the SG has zero inbound rules -- no 22, no 80, no 443 from the Internet.
+  # Management happens through SSM (outbound 443 to the SSM endpoints).
+  ManagementSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${NamePrefix}_sg_mgmt_${NameSuffix}'
+      GroupDescription: Management EC2 Security Group - no inbound, egress 443 only
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to AWS APIs, GitHub, package repos, registries
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_sg_mgmt_${NameSuffix}'
+
+  ManagementHttpEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: WithHttpEgress
+    Properties:
+      GroupId: !Ref ManagementSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+      Description: Optional plain-HTTP package repositories
+
+  # SG for VPC interface endpoints (ssm, ssmmessages, ec2messages, bedrock...).
+  # Accepts 443 from inside the VPC only. Attach it in Terraform if you decide
+  # to add interface endpoints instead of routing SSM traffic via the IGW.
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${NamePrefix}_sg_vpce_${NameSuffix}'
+      GroupDescription: VPC interface endpoints - 443 from within the VPC
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from inside the VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS back into the VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_sg_vpce_${NameSuffix}'
+
+  # For Terraform-managed private resources such as VPC-attached Lambda.
+  # No inbound; egress 443 only.
+  PrivateWorkloadSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${NamePrefix}_sg_private_${NameSuffix}'
+      GroupDescription: Private workloads (Lambda in VPC) - no inbound, egress 443
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to AWS APIs (S3, Bedrock, Step Functions)
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_sg_private_${NameSuffix}'
+
+  # ==========================================================
+  # 3. IAM
+  # ==========================================================
+
+  # ============================================================
+  # Application roles -- created first so PassRole can be scoped
+  # to exactly these ARNs.
+  # ============================================================
+
+  ManagementEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}_role_mgmt_ec2_${NameSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        # ---- S3: artifacts + Terraform state ----
+        - PolicyName: s3-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}'
+              # Terraform creates the remaining buckets.
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutBucketPolicy
+                  - s3:PutBucketVersioning
+                  - s3:PutBucketTagging
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetBucketPolicy
+                  - s3:GetEncryptionConfiguration
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:GetBucketTagging
+                  - s3:GetLifecycleConfiguration
+                  - s3:GetBucketAcl
+                  - s3:GetBucketCORS
+                  - s3:GetBucketLogging
+                  - s3:GetBucketObjectLockConfiguration
+                  - s3:GetBucketRequestPayment
+                  - s3:GetBucketWebsite
+                  - s3:GetAccelerateConfiguration
+                  - s3:GetReplicationConfiguration
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePattern}'
+
+        # ---- Lambda ----
+        - PolicyName: lambda-manage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetFunctionCodeSigningConfig
+                  - lambda:GetPolicy
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:PublishVersion
+                  - lambda:InvokeFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                  - lambda:ListVersionsByFunction
+                  - lambda:CreateAlias
+                  - lambda:UpdateAlias
+                  - lambda:DeleteAlias
+                  - lambda:GetAlias
+                  - lambda:PutFunctionConcurrency
+                  - lambda:DeleteFunctionConcurrency
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppResourcePattern}'
+              - Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                  - lambda:GetAccountSettings
+                  - lambda:CreateEventSourceMapping
+                  - lambda:GetEventSourceMapping
+                  - lambda:UpdateEventSourceMapping
+                  - lambda:DeleteEventSourceMapping
+                  - lambda:GetLayerVersion
+                  - lambda:PublishLayerVersion
+                  - lambda:DeleteLayerVersion
+                Resource: '*'
+
+        # ---- Step Functions ----
+        - PolicyName: stepfunctions-manage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:CreateStateMachine
+                  - states:UpdateStateMachine
+                  - states:DeleteStateMachine
+                  - states:DescribeStateMachine
+                  - states:StartExecution
+                  - states:StartSyncExecution
+                  - states:StopExecution
+                  - states:TagResource
+                  - states:UntagResource
+                  - states:ListTagsForResource
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AppResourcePattern}'
+                  - !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${AppResourcePattern}:*'
+              - Effect: Allow
+                Action:
+                  - states:ListStateMachines
+                  - states:DescribeExecution
+                  - states:ListExecutions
+                  - states:GetExecutionHistory
+                Resource: '*'
+
+        # ---- CloudFormation (this box can also drive CFN stacks) ----
+        - PolicyName: cloudformation-manage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:TagResource
+                  - cloudformation:UntagResource
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppResourcePattern}/*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ListStacks
+                  - cloudformation:ListExports
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+
+        # ---- Create/manage the application roles Terraform owns ----
+        # Terraform creates the Lambda / Step Functions execution roles, so the
+        # box needs role-write permissions. Scoped two ways at once: the role
+        # NAME must match AppRolePattern, and the role must live under
+        # AppRolePath -- so this cannot touch this instance's own role, which
+        # sits at '/'.
+        - PolicyName: manage-application-roles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role${AppRolePath}${AppRolePattern}'
+              # Customer-managed policies for those roles.
+              - Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:TagPolicy
+                  - iam:UntagPolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy${AppRolePath}${AppRolePattern}'
+              # Guardrail: only AWS-managed or same-path policies may be
+              # attached, so the box cannot attach AdministratorAccess.
+              - Effect: Deny
+                Action:
+                  - iam:AttachRolePolicy
+                Resource: '*'
+                Condition:
+                  ArnNotLike:
+                    iam:PolicyARN:
+                      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/*'
+                      - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy${AppRolePath}*'
+
+        # ---- PassRole, restricted to the application role path ----
+        - PolicyName: pass-application-roles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role${AppRolePath}${AppRolePattern}'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - lambda.amazonaws.com
+                      - states.amazonaws.com
+                      - cloudformation.amazonaws.com
+
+        # ---- Read-only IAM, so Terraform can refresh the roles above ----
+        - PolicyName: iam-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListInstanceProfilesForRole
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:ListRoles
+                  - iam:ListPolicies
+                  - iam:GetInstanceProfile
+                  - iam:ListInstanceProfiles
+                Resource: '*'
+
+        # ---- CloudWatch Logs for Terraform-managed log groups ----
+        - PolicyName: logs-manage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/*'
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
+
+        # ---- Bedrock: list models + invoke, for smoke tests from the box ----
+        - PolicyName: bedrock-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelIdPattern}'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+
+        # ---- Read-only EC2/VPC describes, needed by every terraform plan ----
+        - PolicyName: ec2-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_role_mgmt_ec2_${NameSuffix}'
+
+  ManagementEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${NamePrefix}_instprof_mgmt_ec2_${NameSuffix}'
+      Roles:
+        - !Ref ManagementEC2Role
+
+  # ==========================================================
+  # 4. Management EC2
+  # ==========================================================
+
+  ManagementEC2:
+    Type: AWS::EC2::Instance
+    # In a single stack the instance can otherwise launch before the public
+    # route exists, and UserData (Terraform/CLI downloads) plus cfn-signal
+    # would fail on no egress. Across separate stacks the stack ordering
+    # covered this implicitly.
+    DependsOn:
+      - PublicDefaultRoute
+      - PublicSubnetARouteTableAssociation
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !Ref ManagementSecurityGroup
+      IamInstanceProfile: !Ref ManagementEC2InstanceProfile
+      # No KeyName on purpose: there is no SSH path in or out of this box.
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf -y update
+          # ssm-agent ships preinstalled on AL2023; make sure it is running.
+          systemctl enable --now amazon-ssm-agent
+
+          dnf -y install git jq unzip tar gzip
+
+          # AWS CLI v2
+          cd /tmp
+          curl -fsSL -o awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+          unzip -q awscliv2.zip
+          ./aws/install --update
+          rm -rf /tmp/aws /tmp/awscliv2.zip
+
+          # Terraform -- this box provisions S3 / Lambda / Step Functions / Bedrock.
+          # State is LOCAL (terraform.tfstate under /opt/infra), so the root
+          # volume is the only copy: DeleteOnTermination applies, back it up.
+          curl -fsSL -o terraform.zip \
+            "https://releases.hashicorp.com/terraform/${TerraformVersion}/terraform_${TerraformVersion}_linux_amd64.zip"
+          unzip -q -o terraform.zip -d /usr/local/bin
+          chmod +x /usr/local/bin/terraform
+          rm -f /tmp/terraform.zip
+
+          # Default region for the CLI / Terraform AWS provider.
+          echo "export AWS_DEFAULT_REGION=${AWS::Region}" > /etc/profile.d/aws-region.sh
+          echo "export AWS_REGION=${AWS::Region}"        >> /etc/profile.d/aws-region.sh
+          chmod 0644 /etc/profile.d/aws-region.sh
+
+          # Working dir for the Terraform config + its local state file.
+          mkdir -p /opt/infra
+          chown ssm-user:ssm-user /opt/infra 2>/dev/null || true
+
+          terraform version
+          /usr/local/bin/aws --version
+
+          /opt/aws/bin/cfn-signal --exit-code 0 \
+            --stack ${AWS::StackName} \
+            --resource ManagementEC2 \
+            --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_ec2_${NameSuffix}'
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+
+  ManagementEIP:
+    Type: AWS::EC2::EIP
+    Condition: WithEip
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}_eip_ec2_${NameSuffix}'
+
+  ManagementEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: WithEip
+    Properties:
+      InstanceId: !Ref ManagementEC2
+      AllocationId: !GetAtt ManagementEIP.AllocationId
+
+Outputs:
+  # ---------------- Management EC2 ----------------
+  InstanceId:
+    Value: !Ref ManagementEC2
+    Export:
+      Name: !Sub '${ExportPrefix}-ManagementInstanceId'
+
+  PublicIp:
+    Description: EIP if allocated, otherwise the subnet-assigned public IP.
+    Value: !If [WithEip, !Ref ManagementEIP, !GetAtt ManagementEC2.PublicIp]
+
+  PrivateIp:
+    Value: !GetAtt ManagementEC2.PrivateIp
+
+  SsmSessionCommand:
+    Description: How to get a shell on the box - there is no SSH.
+    Value: !Sub 'aws ssm start-session --target ${ManagementEC2} --region ${AWS::Region}'
+
+  # ---------------- Network ----------------
+  VpcId:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub '${ExportPrefix}-VpcId'
+
+  VpcCidrOut:
+    Value: !Ref VpcCidr
+    Export:
+      Name: !Sub '${ExportPrefix}-VpcCidr'
+
+  PublicSubnetAId:
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: !Sub '${ExportPrefix}-PublicSubnetAId'
+
+  PublicSubnetBId:
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: !Sub '${ExportPrefix}-PublicSubnetBId'
+
+  PrivateSubnetAId:
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub '${ExportPrefix}-PrivateSubnetAId'
+
+  PrivateSubnetBId:
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub '${ExportPrefix}-PrivateSubnetBId'
+
+  PrivateSubnetIds:
+    Description: Comma-separated private subnets, for Terraform-managed Lambda VPC config.
+    Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+    Export:
+      Name: !Sub '${ExportPrefix}-PrivateSubnetIds'
+
+  # ---------------- Security Groups ----------------
+  ManagementSecurityGroupId:
+    Value: !Ref ManagementSecurityGroup
+    Export:
+      Name: !Sub '${ExportPrefix}-ManagementSecurityGroupId'
+
+  VpcEndpointSecurityGroupId:
+    Value: !Ref VpcEndpointSecurityGroup
+    Export:
+      Name: !Sub '${ExportPrefix}-VpcEndpointSecurityGroupId'
+
+  PrivateWorkloadSecurityGroupId:
+    Value: !Ref PrivateWorkloadSecurityGroup
+    Export:
+      Name: !Sub '${ExportPrefix}-PrivateWorkloadSecurityGroupId'
+
+  # ---------------- IAM ----------------
+  ManagementEC2RoleArn:
+    Value: !GetAtt ManagementEC2Role.Arn
+    Export:
+      Name: !Sub '${ExportPrefix}-ManagementEC2RoleArn'
+
+  ManagementEC2InstanceProfileName:
+    Value: !Ref ManagementEC2InstanceProfile
+    Export:
+      Name: !Sub '${ExportPrefix}-ManagementEC2InstanceProfileName'
+
+

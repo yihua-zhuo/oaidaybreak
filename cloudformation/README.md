@@ -1,9 +1,12 @@
-# CloudFormation — bootstrap up to the Management EC2
+# CloudFormation — management bootstrap (`oaidaybreak`)
 
-Implements `setup.md` stacks **01–04** only. Everything from S3 / Lambda /
-Step Functions / Bedrock onward is provisioned **with Terraform, from the
-management EC2 itself** — that is why stack 03 grants the box those
-permissions instead of creating the resources here.
+One stack: `management-bootstrap.yaml`. It creates the network, security groups,
+the management EC2 role and the management EC2 itself.
+
+Everything downstream — S3, Lambda, Step Functions, Bedrock, **and the
+application IAM roles** — is provisioned with **Terraform from the instance**,
+using **local state**. That is why this template grants the EC2 role those
+permissions instead of creating the resources itself.
 
 Region: `us-east-1`
 
@@ -13,125 +16,111 @@ Region: `us-east-1`
 <prefix>_<type>_<suffix>      →  mpa_sec_ec2_oaidaybreak
 ```
 
-Driven by two parameters present in every template:
+| Parameter    | Default       |
+| ------------ | ------------- |
+| `NamePrefix` | `mpa_sec`     |
+| `NameSuffix` | `oaidaybreak` |
 
-| Parameter     | Default       |
-| ------------- | ------------- |
-| `NamePrefix`  | `mpa_sec`     |
-| `NameSuffix`  | `oaidaybreak` |
+Underscores everywhere they are legal; hyphens only where AWS rejects or
+discourages them:
 
-Underscores are used everywhere they are legal. Hyphens are used only where
-AWS rejects or discourages underscores:
+| Identifier                      | Form                               |
+| ------------------------------- | ---------------------------------- |
+| Name tags, IAM roles, SGs, EC2  | `mpa_sec_ec2_oaidaybreak`          |
+| S3 buckets (underscore illegal) | `mpa-sec-s3-artifacts-oaidaybreak` |
+| CFN export names                | `mpa-sec-oaidaybreak-VpcId`        |
 
-| Identifier                     | Form                             |
-| ------------------------------ | -------------------------------- |
-| Name tags, IAM roles, SGs, EC2 | `mpa_sec_ec2_oaidaybreak`        |
-| S3 buckets (underscore illegal)| `mpa-sec-s3-artifacts-oaidaybreak` |
-| CFN export names               | `mpa-sec-oaidaybreak-VpcId`      |
+## What it creates
 
-## Stacks
-
-| # | File | Creates |
-| - | ---- | ------- |
-| 01 | `01-network.yaml` | VPC, 2 public + 2 private subnets, IGW, route tables, S3 gateway endpoint |
-| 02 | `02-security-groups.yaml` | Management SG (**no inbound**, egress 443), VPC-endpoint SG, private-workload SG |
-| 03 | `03-iam.yaml` | `mpa_sec_role_mgmt_ec2_oaidaybreak` + instance profile, `mpa_sec_role_lambda_oaidaybreak`, `mpa_sec_role_sfn_oaidaybreak` |
-| 04 | `04-management-ec2.yaml` | `mpa_sec_ec2_oaidaybreak` + EIP, Terraform/AWS CLI preinstalled |
-
-Deploy in order — each consumes the previous stack's outputs.
+| Group | Resources |
+| ----- | --------- |
+| Network | VPC, 2 public + 2 private subnets, IGW, route tables, S3 gateway endpoint |
+| Security groups | `mpa_sec_sg_mgmt_oaidaybreak` (**no inbound**, egress 443), `..._sg_vpce_...`, `..._sg_private_...` |
+| IAM | `mpa_sec_role_mgmt_ec2_oaidaybreak` + instance profile |
+| Compute | `mpa_sec_ec2_oaidaybreak` + EIP, Terraform & AWS CLI preinstalled |
 
 ## Deploy
 
 ```bash
-REGION=us-east-1
-PREFIX=mpa-sec-oaidaybreak
-
-# 01 — network
 aws cloudformation deploy \
-  --region $REGION \
-  --stack-name ${PREFIX}-01-network \
-  --template-file 01-network.yaml
-
-VPC_ID=$(aws cloudformation describe-stacks --region $REGION \
-  --stack-name ${PREFIX}-01-network \
-  --query "Stacks[0].Outputs[?OutputKey=='VpcId'].OutputValue" --output text)
-PUBLIC_SUBNET=$(aws cloudformation describe-stacks --region $REGION \
-  --stack-name ${PREFIX}-01-network \
-  --query "Stacks[0].Outputs[?OutputKey=='PublicSubnetAId'].OutputValue" --output text)
-
-# 02 — security groups
-aws cloudformation deploy \
-  --region $REGION \
-  --stack-name ${PREFIX}-02-sg \
-  --template-file 02-security-groups.yaml \
-  --parameter-overrides VpcId=$VPC_ID
-
-MGMT_SG=$(aws cloudformation describe-stacks --region $REGION \
-  --stack-name ${PREFIX}-02-sg \
-  --query "Stacks[0].Outputs[?OutputKey=='ManagementSecurityGroupId'].OutputValue" --output text)
-
-# 03 — IAM (creates named roles)
-aws cloudformation deploy \
-  --region $REGION \
-  --stack-name ${PREFIX}-03-iam \
-  --template-file 03-iam.yaml \
+  --region us-east-1 \
+  --stack-name mpa-sec-oaidaybreak-bootstrap \
+  --template-file management-bootstrap.yaml \
   --capabilities CAPABILITY_NAMED_IAM
-
-INSTANCE_PROFILE=$(aws cloudformation describe-stacks --region $REGION \
-  --stack-name ${PREFIX}-03-iam \
-  --query "Stacks[0].Outputs[?OutputKey=='ManagementEC2InstanceProfileName'].OutputValue" --output text)
-
-# 04 — management EC2
-aws cloudformation deploy \
-  --region $REGION \
-  --stack-name ${PREFIX}-04-ec2 \
-  --template-file 04-management-ec2.yaml \
-  --parameter-overrides \
-      PublicSubnetId=$PUBLIC_SUBNET \
-      ManagementSecurityGroupId=$MGMT_SG \
-      ManagementInstanceProfileName=$INSTANCE_PROFILE
 ```
 
-`--capabilities CAPABILITY_NAMED_IAM` is required on stack 03 only, because the
-roles carry explicit names.
+`CAPABILITY_NAMED_IAM` is required because the role carries an explicit name.
+
+To override naming or sizing:
+
+```bash
+  --parameter-overrides NamePrefix=mpa_sec NameSuffix=oaidaybreak InstanceType=t3.medium
+```
 
 ## Access
 
-There is no SSH — no key pair, and the SG has zero inbound rules. Use SSM:
+There is no SSH — no key pair, and the management SG has zero inbound rules.
 
 ```bash
 aws ssm start-session --region us-east-1 \
   --target $(aws cloudformation describe-stacks --region us-east-1 \
-    --stack-name mpa-sec-oaidaybreak-04-ec2 \
+    --stack-name mpa-sec-oaidaybreak-bootstrap \
     --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text)
 ```
 
 The public IP / EIP exists so the box can reach **out** (GitHub, AWS APIs,
-package repos, Terraform provider registry), not so anyone can reach in.
+package repos, Terraform registry), not so anyone can reach in.
+
+## Terraform on the box
+
+Terraform and the AWS CLI are installed by UserData; work in `/opt/infra`. The
+instance role is picked up automatically — no keys to configure.
+
+**The application roles must be created under the IAM path
+`/oaidaybreak/`**, or Terraform will get `AccessDenied`:
+
+```hcl
+resource "aws_iam_role" "lambda_exec" {
+  name = "mpa_sec_role_lambda_oaidaybreak"
+  path = "/oaidaybreak/"          # required -- see AppRolePath
+  # ...
+}
+```
+
+Stack outputs are exported, so Terraform can look up the network instead of
+hardcoding ids:
+
+```hcl
+data "aws_cloudformation_export" "private_subnets" {
+  name = "mpa-sec-oaidaybreak-PrivateSubnetIds"
+}
+```
 
 ## Notes / decisions
 
-- **SSM path.** The instance sits in a public subnet with a 0.0.0.0/0 route via
-  the IGW, so the SSM agent reaches the SSM endpoints over egress 443 — no
-  interface endpoints needed. `mpa_sec_sg_vpce_oaidaybreak` is provided in case
-  you later move to interface endpoints and drop the public IP.
-- **Egress is 443-only**, per `setup.md` §3. Amazon Linux 2023 repos are HTTPS,
-  so package installs work. `AllowHttpEgress=true` opens 80 if you ever need a
-  plain-HTTP mirror.
-- **No NAT Gateway.** The private subnets therefore have no Internet egress —
-  they reach S3 through the gateway endpoint only. A VPC-attached Lambda that
-  needs to call another AWS API will need an interface endpoint for that
-  service (attach `mpa_sec_sg_vpce_oaidaybreak`), or to run outside the VPC.
-- **`iam:PassRole` is scoped** to exactly the two application role ARNs, with an
-  `iam:PassedToService` condition — not `*`.
-- The EC2 role deliberately has **no `iam:Create*`/`Put*`**. If your Terraform
-  needs to create new roles, add that permission explicitly rather than
-  broadening it here.
-- **Terraform uses local state** (`/opt/infra/terraform.tfstate` on the box) —
-  no state bucket, no DynamoDB lock table, and no IAM policy for either. Two
-  consequences: the root volume holds the only copy of your state, and it is
-  created with `DeleteOnTermination: true`, so terminating the instance
-  destroys the state while leaving the resources it tracks orphaned. Back
-  `/opt/infra` up (e.g. `aws s3 cp` to the artifact bucket) before any
-  instance replacement. There is also no locking, so run Terraform from one
-  session at a time.
+- **EC2 can create IAM roles**, scoped two ways at once: the role name must
+  match `mpa_sec_role_*_oaidaybreak` **and** it must sit under the path
+  `/oaidaybreak/`. The instance's own role is at path `/`, so the box cannot
+  modify or escalate its own permissions despite the name matching. An explicit
+  `Deny` also blocks attaching any managed policy outside
+  `aws:policy/service-role/*` or the project's own path, so
+  `AdministratorAccess` cannot be attached to a new role.
+- **SSM works with 443-only egress.** The instance is in a public subnet routed
+  via the IGW, so the agent reaches the SSM endpoints outbound — no interface
+  endpoints required. `mpa_sec_sg_vpce_oaidaybreak` is there if you later drop
+  the public IP and switch to interface endpoints.
+- **No NAT Gateway.** Private subnets therefore have no Internet egress; they
+  reach S3 via the gateway endpoint only. A VPC-attached Lambda calling any
+  other AWS API needs an interface endpoint for that service, or should run
+  outside the VPC.
+- **Local Terraform state** lives at `/opt/infra/terraform.tfstate` on a root
+  volume created with `DeleteOnTermination: true`. That volume is the only copy:
+  terminating the instance destroys the state and orphans everything it tracked.
+  Back `/opt/infra` up (e.g. `aws s3 cp` to the artifact bucket — the role
+  already has write access) before any instance replacement. No locking either,
+  so run Terraform from one session at a time.
+- **`DependsOn` on the instance** (public route + subnet association) matters in
+  a single stack: without it CloudFormation may launch the EC2 before egress
+  exists, and UserData plus the 15-minute `cfn-signal` wait would fail.
+- The EC2 role has **no `iam:*` write access outside `/oaidaybreak/`** and no
+  permission to create users, groups or access keys.
